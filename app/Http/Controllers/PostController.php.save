@@ -1,0 +1,210 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Post;
+use Illuminate\Http\Request;
+
+class PostController extends Controller
+{
+    // صفحه اصلی: لیست تمام پست‌ها
+    public function index()
+    {
+        $posts = Post::with('user')->latest()->paginate(6);
+        return view('posts.index', compact('posts'));
+    }
+
+    // نمایش جزئیات یک پست
+    public function show(Post $post)
+    {
+        return view('posts.show', compact('post'));
+    }
+}<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Post;
+use App\Models\Category; // مدل Category را ایمپورت می‌کنیم
+use App\Models\Tag;      // مدل Tag را ایمپورت می‌کنیم
+use Illuminate\Http\Request; 
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Storage; // برای مدیریت فایل‌ها
+use Illuminate\Support\Str;
+
+class PostController extends Controller
+{
+    /**
+     * نمایش لیست پست‌های منتشر شده در صفحه اصلی با صفحه‌بندی.
+     */
+    public function index()
+    {
+        // فقط پست‌هایی که تاریخ انتشار دارند را نمایش می‌دهیم.
+        // بر اساس تاریخ انتشار جدیدترین به قدیمی‌ترین مرتب می‌کنیم.
+        // با 'user' برای نمایش نام نویسنده واکشی می‌کنیم.
+        $posts = Post::whereNotNull('published_at')
+                      ->latest('published_at')
+                      ->with('user') 
+                      ->paginate(10); // صفحه بندی
+
+        return view('posts.index', compact('posts'));
+    }
+    
+    /**
+     * نمایش فرم برای ساخت یک پست جدید (برای کاربران عادی).
+     */
+    public function create()
+    {
+        // در اینجا می‌توانید مدل‌ها و دسته‌بندی‌ها را برای استفاده در فرم ارسال کنید
+        // فرض می‌کنیم که Category و Tag از قبل مدل شده‌اند.
+        $categories = Category::all(); 
+        $tags = Tag::all();
+        return view('posts.create', compact('categories', 'tags'));
+    }
+
+    /**
+     * ذخیره پست جدید در دیتابیس.
+     */
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'content' => 'required|string',
+            'thumbnail' => 'nullable|image|mimes:jpeg,png,jpg,gif,svg|max:2048',
+            'tag_ids' => 'nullable|array', 
+            'category_id' => 'required|exists:categories,id', // اضافه شده: دسته‌بندی باید انتخاب شود
+        ]);
+
+        $thumbnailPath = null;
+        if ($request->hasFile('thumbnail')) {
+            // ذخیره فایل در مسیر storage/app/public/thumbnails
+            $thumbnailPath = $request->file('thumbnail')->store('thumbnails', 'public'); 
+        }
+
+        $post = Post::create([
+            'user_id' => Auth::id(),
+            'title' => $validated['title'],
+            'content' => $validated['content'],
+            'slug' => Str::slug($validated['title']), 
+            'thumbnail' => $thumbnailPath,
+            'category_id' => $validated['category_id'], // اضافه شده
+            // اگر کاربر عادی دکمه انتشار را بزند، پست منتشر می‌شود.
+            // در غیر این صورت به صورت Draft ذخیره می‌شود.
+            'published_at' => $request->has('publish') ? now() : null, 
+        ]);
+        
+        // ذخیره برچسب‌ها
+        if (!empty($validated['tag_ids'])) {
+            $post->tags()->attach($validated['tag_ids']);
+        }
+
+        return redirect()->route('dashboard')->with('success', 'پست با موفقیت ذخیره شد.');
+    }
+    
+    /**
+     * نمایش جزئیات یک پست خاص بر اساس slug آن.
+     */
+    public function show(Post $post)
+    {
+        // بررسی می‌کند که پست حتماً منتشر شده باشد
+        // اگر منتشر نشده باشد، فقط نویسنده پست اجازه مشاهده دارد.
+        if (is_null($post->published_at)) {
+            // اگر لاگین نکرده یا نویسنده پست نیست، 404
+            if (!Auth::check() || $post->user_id !== Auth::id()) {
+                abort(404);
+            }
+        }
+        
+        // واکشی نظرات تأیید شده و کاربر نویسنده
+        $post->load(['user', 'comments' => function ($query) {
+            $query->where('is_approved', true)->latest();
+        }]);
+
+        return view('posts.show', compact('post'));
+    }
+
+    /**
+     * نمایش فرم ویرایش پست (فقط برای نویسنده).
+     */
+    public function edit(Post $post)
+    {
+        // بررسی مجوزها: فقط نویسنده پست اجازه ویرایش دارد
+        if ($post->user_id !== Auth::id()) {
+            abort(403, 'شما اجازه دسترسی به این محتوا را ندارید.');
+        }
+
+        $categories = Category::all(); 
+        $tags = Tag::all();
+        
+        return view('posts.edit', compact('post', 'categories', 'tags'));
+    }
+
+    /**
+     * به‌روزرسانی پست در دیتابیس (فقط توسط نویسنده).
+     */
+    public function update(Request $request, Post $post)
+    {
+        if ($post->user_id !== Auth::id()) {
+            abort(403);
+        }
+        
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'content' => 'required|string',
+            'thumbnail' => 'nullable|image|mimes:jpeg,png,jpg,gif,svg|max:2048',
+            'tag_ids' => 'nullable|array', 
+            'category_id' => 'required|exists:categories,id',
+        ]);
+
+        $thumbnailPath = $post->thumbnail;
+        if ($request->hasFile('thumbnail')) {
+            // حذف تصویر قبلی (اگر وجود دارد)
+            if ($post->thumbnail) {
+                Storage::disk('public')->delete($post->thumbnail);
+            }
+            // ذخیره تصویر جدید
+            $thumbnailPath = $request->file('thumbnail')->store('thumbnails', 'public');
+        }
+        
+        // اگر 'unpublish' وجود داشت، تاریخ انتشار را null کن. در غیر این صورت، اگر 'publish' بود، به الان تنظیم کن.
+        $publishedAt = $post->published_at;
+        if ($request->has('unpublish')) {
+             $publishedAt = null;
+        } elseif ($request->has('publish')) {
+             $publishedAt = now();
+        }
+
+        $post->update([
+            'title' => $validated['title'],
+            'content' => $validated['content'],
+            'slug' => Str::slug($validated['title']), 
+            'thumbnail' => $thumbnailPath,
+            'category_id' => $validated['category_id'],
+            'published_at' => $publishedAt,
+        ]);
+        
+        // همگام سازی برچسب‌ها
+        $post->tags()->sync($validated['tag_ids'] ?? []); 
+
+        return redirect()->route('dashboard')->with('success', 'پست با موفقیت به‌روز شد.');
+    }
+
+    /**
+     * حذف پست (فقط توسط نویسنده).
+     */
+    public function destroy(Post $post)
+    {
+        if ($post->user_id !== Auth::id()) {
+            abort(403);
+        }
+        
+        // حذف فایل تصویر مرتبط (Thumbnail)
+        if ($post->thumbnail) {
+            Storage::disk('public')->delete($post->thumbnail);
+        }
+
+        // حذف رکورد
+        $post->delete(); 
+        
+        return redirect()->route('dashboard')->with('success', 'پست با موفقیت حذف شد.');
+    }
+}
